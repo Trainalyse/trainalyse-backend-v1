@@ -1,0 +1,124 @@
+Table users {
+  id            uuid [pk]
+  username      varchar [unique, not null]
+  email         varchar [unique, not null]
+  password_hash varchar [not null]
+  created_at    timestamptz [not null, default: `now()`]
+  updated_at    timestamptz [not null, default: `now()`]
+}
+
+enum height_unit {
+  cm
+  ft
+  in
+}
+enum weight_unit {
+  kg
+  lb
+}
+
+// one row per user, edited in place (height barely changes, birth_date never does)
+Table user_stats {
+  user_id    uuid [pk]  // 1:1 with user
+  height_cm  numeric(5,2) [note: 'canonical, always cm']
+  birth_date date
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  Note: 'CHECK (height_cm IS NULL OR height_cm > 0)'
+}
+
+// append-only history — this is what enables bodyweight-over-time
+Table user_weight {
+  id         uuid [pk]
+  user_id    uuid [not null]
+  weight_kg  numeric(5,2) [not null]
+  created_at timestamptz [not null, default: `now()`]
+  indexes { (user_id, created_at) }
+  Note: 'CHECK (weight_kg > 0)'
+}
+
+Table user_settings {
+  user_id     uuid [pk]  // 1:1 with user
+  height_unit height_unit [not null, default: 'cm']
+  weight_unit weight_unit [not null, default: 'kg']
+}
+
+Table workouts {
+  id          uuid [pk]
+  user_id     uuid [not null]
+  title       varchar [not null]
+  created_at  timestamptz [not null, default: `now()`]  // row created
+  updated_at  timestamptz [not null, default: `now()`]
+  started_at  timestamptz  // workout began
+  finished_at timestamptz  // workout ended
+  indexes { (user_id, started_at) }
+}
+
+enum exercise_type {
+  weight_and_reps
+  duration
+}
+
+// global catalog, seeded
+Table exercises {
+  id            uuid [pk]
+  name          varchar [unique, not null]
+  type          exercise_type [not null]
+  is_bodyweight bool [not null]
+}
+
+Table exercise_workout {
+  id          uuid [pk]
+  exercise_id uuid [not null]
+  workout_id  uuid [not null]
+  position    smallint [not null]
+  // NOTE: this unique should be DEFERRABLE INITIALLY DEFERRED so reordering
+  // within a single transaction doesn't trip mid-statement. DBML can't express
+  // deferrability — add it in the migration: transient dup positions are fine,
+  // must be unique by COMMIT.
+  indexes { (workout_id, position) [unique] }
+}
+
+Table sets {
+  id                  uuid [pk]
+  exercise_workout_id uuid [not null]
+  position            smallint [not null]
+  // unique should be DEFERRABLE INITIALLY DEFERRED (see exercise_workout note)
+  indexes { (exercise_workout_id, position) [unique] }
+}
+
+Table dropsets {
+  id        uuid [pk]
+  set_id    uuid [not null]
+  // exactly one of reps / duration_sec is set (enforced by chk_reps_xor_duration).
+  // reps-shaped rows belong to weight_and_reps exercises, duration-shaped to
+  // duration exercises — that match is enforced in app code, NOT the DB.
+  reps      smallint
+  duration_sec integer
+  load_kg   numeric(5,2) [not null, default: 0]
+  assistance numeric(5,2) [not null, default: 0]
+  resistance numeric(5,2) [not null, default: 0]
+  position  smallint [not null]
+  // unique should be DEFERRABLE INITIALLY DEFERRED (see exercise_workout note)
+  indexes { (set_id, position) [unique] }
+  checks {
+    `(reps IS NULL) != (duration_sec IS NULL)`      [name: 'chk_reps_xor_duration']
+    `NOT (assistance > 0 AND resistance > 0)`       [name: 'chk_assistance_resistance']
+    `reps IS NULL OR reps > 0`                       [name: 'chk_reps_positive']
+    `duration_sec IS NULL OR duration_sec > 0`       [name: 'chk_duration_positive']
+    `load_kg >= 0 AND assistance >= 0 AND resistance >= 0` [name: 'chk_loads_nonneg']
+  }
+}
+
+
+// ON DELETE: cascade down the user + workout tree; restrict on exercise_id so a
+// seeded exercise referenced by historical workouts can't be deleted out from
+// under them.
+Ref: user_stats.user_id - users.id      [delete: cascade]   // 1:1
+Ref: user_weight.user_id > users.id      [delete: cascade]
+Ref: user_settings.user_id - users.id    [delete: cascade]  // 1:1
+Ref: workouts.user_id > users.id         [delete: cascade]
+Ref: exercise_workout.workout_id > workouts.id   [delete: cascade]
+Ref: exercise_workout.exercise_id > exercises.id [delete: restrict]
+Ref: sets.exercise_workout_id > exercise_workout.id [delete: cascade]
+Ref: dropsets.set_id > sets.id           [delete: cascade]
